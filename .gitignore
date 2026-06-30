@@ -58,3 +58,4 @@ src/testTestingRootWkspc/coverageWorkspace/.coverage
 ai-artifacts/*
 
 exports/
+.vscode/

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import configparser
+import json
 import os
 import re
 import sys
@@ -12,12 +14,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote, urlencode, unquote
+from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROJECT_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 DEFAULT_CONFIG = PROJECT_ROOT / "scholar_export.conf"
 DEFAULT_EXPORT_DIR_NAME = "exports"
+CROSSREF_WORKS_URL = "https://api.crossref.org/works"
+CROSSREF_TIMEOUT_SECONDS = 10
+CROSSREF_USER_AGENT = "scholar_export_bib/1.0"
 
 if (
     PROJECT_VENV_PYTHON.exists()
@@ -221,13 +228,280 @@ def bibtex_escape(value: Any) -> str:
     return "".join(replacements.get(char, char) for char in text)
 
 
+def is_initial_token(value: str) -> bool:
+    letters = re.sub(r"[^A-Za-z]", "", value)
+    return bool(letters) and letters.isupper() and len(letters) <= 4
+
+
+def split_author_string(value: str) -> list[str]:
+    text = value.strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            parsed = None
+
+        if isinstance(parsed, (list, tuple)):
+            return [str(author).strip() for author in parsed if str(author).strip()]
+
+    if re.search(r"\s+and\s+", text, flags=re.IGNORECASE):
+        return [
+            author.strip()
+            for author in re.split(r"\s+and\s+", text, flags=re.IGNORECASE)
+            if author.strip()
+        ]
+
+    return [text]
+
+
+def format_author_name(author: str) -> str:
+    name = re.sub(r"\s+", " ", author).strip()
+    if not name or "," in name:
+        return name
+
+    parts = name.split()
+    if len(parts) == 1:
+        return name
+
+    if is_initial_token(parts[0]):
+        given = parts[0]
+        family = " ".join(parts[1:])
+        return f"{family}, {given}"
+
+    surname_particles = {
+        "al",
+        "bin",
+        "da",
+        "de",
+        "del",
+        "della",
+        "den",
+        "der",
+        "di",
+        "dos",
+        "du",
+        "ibn",
+        "la",
+        "le",
+        "van",
+        "von",
+    }
+    family_start = len(parts) - 1
+    while family_start > 0 and parts[family_start - 1].lower() in surname_particles:
+        family_start -= 1
+
+    given = " ".join(parts[:family_start])
+    family = " ".join(parts[family_start:])
+    return f"{family}, {given}" if given else family
+
+
+def format_bibtex_authors(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        authors = [str(author).strip() for author in value if str(author).strip()]
+    else:
+        authors = split_author_string(str(value))
+
+    return " and ".join(format_author_name(author) for author in authors)
+
+
+def metadata_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def is_placeholder_metadata(value: Any) -> bool:
+    return metadata_text(value).lower() in {"", "na", "n/a", "none", "unknown"}
+
+
+def is_truncated_metadata(value: Any) -> bool:
+    text = metadata_text(value)
+    return "…" in text or "..." in text
+
+
+def usable_metadata(value: Any) -> str | None:
+    text = metadata_text(value)
+    if is_placeholder_metadata(text) or is_truncated_metadata(text):
+        return None
+    return text
+
+
+def publication_has_truncated_venue(pub: Publication) -> bool:
+    bib = pub.get("bib", {})
+    return any(
+        is_truncated_metadata(bib.get(key))
+        for key in ("journal", "booktitle", "conference", "venue")
+    )
+
+
+def publication_has_usable_venue(pub: Publication) -> bool:
+    bib = pub.get("bib", {})
+    return any(
+        usable_metadata(bib.get(key)) is not None
+        for key in ("journal", "booktitle", "conference", "venue")
+    )
+
+
+def extract_doi(*values: Any) -> str | None:
+    for value in values:
+        if not value:
+            continue
+
+        text = unquote(str(value))
+        match = re.search(r"10\.\d{4,9}/[^\s\"<>]+", text, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        doi = re.sub(r"[?#].*$", "", match.group(0)).rstrip(".,;:)]}/")
+        if doi.lower().endswith(".pdf"):
+            doi = doi[:-4]
+        return doi
+
+    return None
+
+
+def crossref_json(url: str) -> dict[str, Any] | None:
+    request = Request(url, headers={"User-Agent": CROSSREF_USER_AGENT})
+    try:
+        with urlopen(request, timeout=CROSSREF_TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except Exception as exc:
+        print(f"Crossref lookup failed: {exc}", file=sys.stderr)
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
+def crossref_item_by_doi(doi: str) -> dict[str, Any] | None:
+    data = crossref_json(f"{CROSSREF_WORKS_URL}/{quote(doi, safe='')}")
+    item = data.get("message") if data else None
+    return item if isinstance(item, dict) else None
+
+
+def normalize_title_for_match(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def crossref_item_by_title(title: str, year: int | None) -> dict[str, Any] | None:
+    params = {"query.title": title, "rows": "5"}
+    if year is not None:
+        params["filter"] = f"from-pub-date:{year},until-pub-date:{year}"
+
+    data = crossref_json(f"{CROSSREF_WORKS_URL}?{urlencode(params)}")
+    items = (data or {}).get("message", {}).get("items", [])
+    if not isinstance(items, list):
+        return None
+
+    wanted = normalize_title_for_match(title)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        candidates = item.get("title") or []
+        if isinstance(candidates, str):
+            candidates = [candidates]
+
+        for candidate in candidates:
+            if normalize_title_for_match(candidate) == wanted:
+                return item
+
+    return None
+
+
+def first_crossref_value(item: dict[str, Any], key: str) -> str | None:
+    value = item.get(key)
+    if isinstance(value, list):
+        value = next((entry for entry in value if usable_metadata(entry)), None)
+    return usable_metadata(value)
+
+
+def crossref_year(item: dict[str, Any]) -> int | None:
+    for key in ("published-print", "published-online", "published", "issued"):
+        date_parts = item.get(key, {}).get("date-parts")
+        if (
+            isinstance(date_parts, list)
+            and date_parts
+            and isinstance(date_parts[0], list)
+            and date_parts[0]
+        ):
+            try:
+                return int(date_parts[0][0])
+            except (TypeError, ValueError):
+                return None
+
+    return None
+
+
+def update_missing_bib_value(bib: dict[str, Any], key: str, value: Any) -> bool:
+    clean_value = usable_metadata(value)
+    if clean_value is None:
+        return False
+
+    current_value = bib.get(key)
+    if usable_metadata(current_value) is not None:
+        return False
+
+    bib[key] = clean_value
+    return True
+
+
+def apply_crossref_metadata(pub: Publication, item: dict[str, Any]) -> bool:
+    bib = pub.setdefault("bib", {})
+    updated = False
+    item_type = str(item.get("type") or "").lower()
+    container = first_crossref_value(item, "container-title")
+    venue_key = "booktitle" if "proceedings" in item_type else "journal"
+
+    if container:
+        updated = update_missing_bib_value(bib, venue_key, container) or updated
+
+    metadata_map = {
+        "doi": first_crossref_value(item, "DOI"),
+        "volume": first_crossref_value(item, "volume"),
+        "number": first_crossref_value(item, "issue"),
+        "pages": first_crossref_value(item, "page"),
+        "publisher": first_crossref_value(item, "publisher"),
+        "pub_year": crossref_year(item),
+    }
+    for key, value in metadata_map.items():
+        updated = update_missing_bib_value(bib, key, value) or updated
+
+    if "proceedings" in item_type:
+        bib["pub_type"] = "inproceedings"
+    elif item_type == "journal-article":
+        bib["pub_type"] = "article"
+
+    return updated
+
+
+def resolve_crossref_metadata(pub: Publication) -> bool:
+    bib = pub.get("bib", {})
+    doi = bib.get("doi") or extract_doi(
+        bib.get("url"),
+        pub.get("pub_url"),
+        pub.get("eprint_url"),
+        pub.get("url"),
+    )
+
+    item = crossref_item_by_doi(str(doi)) if doi else None
+    if item is None:
+        title = usable_metadata(bib.get("title"))
+        item = crossref_item_by_title(title, get_pub_year(pub)) if title else None
+
+    if item is None:
+        return False
+
+    return apply_crossref_metadata(pub, item)
+
+
 def make_bibtex_key(pub: Publication, index: int) -> str:
     bib = pub.get("bib", {})
     author = str(bib.get("author", "pub")).split(" and ")[0].split(",")[0]
     year = parse_year(bib.get("pub_year")) or "noyear"
     title = str(bib.get("title", "publication"))
 
-    raw_key = f"{author}_{year}_{title}".lower()
+    raw_key = f"{author}_{year}".lower()
     key = re.sub(r"[^a-z0-9]+", "_", raw_key).strip("_")
     return key[:80] or f"pub_{index:04d}"
 
@@ -243,14 +517,20 @@ def publication_identity(pub: Publication) -> tuple[str, int | None]:
     return title, get_pub_year(pub)
 
 
-def fill_publication(pub: Publication, delay_seconds: float) -> Publication | None:
+def fill_publication(
+    pub: Publication,
+    delay_seconds: float,
+    *,
+    required: bool = True,
+) -> Publication | None:
     require_scholarly()
 
     try:
         filled = scholarly.fill(pub)
     except Exception as exc:
         title = pub.get("bib", {}).get("title", "unknown title")
-        print(f"Skipping '{title}': {exc}", file=sys.stderr)
+        action = "Skipping" if required else "Could not fill metadata for"
+        print(f"{action} '{title}': {exc}", file=sys.stderr)
         return None
 
     if delay_seconds > 0:
@@ -289,6 +569,7 @@ def search_publications(config: SearchConfig) -> list[Publication]:
 
             title = pub.get("bib", {}).get("title", "untitled")
             publication = pub
+            filled_for_metadata = False
 
             if config.fill_publications:
                 filled = fill_publication(pub, config.delay_seconds)
@@ -296,21 +577,51 @@ def search_publications(config: SearchConfig) -> list[Publication]:
                     continue
                 publication = filled
 
+            if publication_has_truncated_venue(publication):
+                if resolve_crossref_metadata(publication):
+                    print(f"Resolved venue metadata: {title}")
+
+            if (
+                not config.fill_publications
+                and publication_has_truncated_venue(publication)
+                and not publication_has_usable_venue(publication)
+            ):
+                filled = fill_publication(
+                    publication,
+                    config.delay_seconds,
+                    required=False,
+                )
+                if filled:
+                    publication = filled
+                    filled_for_metadata = True
+
             year = get_pub_year(publication)
             if year is None:
                 print(f"Skipping publication without year: {title}")
-                if not config.fill_publications and config.delay_seconds > 0:
+                if (
+                    not config.fill_publications
+                    and not filled_for_metadata
+                    and config.delay_seconds > 0
+                ):
                     time.sleep(config.delay_seconds)
                 continue
 
             if not (config.start_year <= year <= config.end_year):
-                if not config.fill_publications and config.delay_seconds > 0:
+                if (
+                    not config.fill_publications
+                    and not filled_for_metadata
+                    and config.delay_seconds > 0
+                ):
                     time.sleep(config.delay_seconds)
                 continue
 
             identity = publication_identity(publication)
             if identity in seen:
-                if not config.fill_publications and config.delay_seconds > 0:
+                if (
+                    not config.fill_publications
+                    and not filled_for_metadata
+                    and config.delay_seconds > 0
+                ):
                     time.sleep(config.delay_seconds)
                 continue
             seen.add(identity)
@@ -318,7 +629,11 @@ def search_publications(config: SearchConfig) -> list[Publication]:
             matches.append(publication)
             print(f"Found: {publication.get('bib', {}).get('title', title)} ({year})")
 
-            if not config.fill_publications and config.delay_seconds > 0:
+            if (
+                not config.fill_publications
+                and not filled_for_metadata
+                and config.delay_seconds > 0
+            ):
                 time.sleep(config.delay_seconds)
     except Exception as exc:
         print(f"Search stopped early: {exc}", file=sys.stderr)
@@ -328,33 +643,83 @@ def search_publications(config: SearchConfig) -> list[Publication]:
 
 def publication_type(pub: Publication) -> str:
     bib = pub.get("bib", {})
-    pub_type = str(pub.get("pub_type") or pub.get("type") or "").lower()
+    pub_type = str(
+        pub.get("pub_type") or pub.get("type") or bib.get("pub_type") or ""
+    ).lower()
     title = str(bib.get("title", "")).lower()
-    venue = str(bib.get("venue") or bib.get("journal") or "").lower()
+    venue = str(
+        bib.get("venue")
+        or bib.get("journal")
+        or bib.get("booktitle")
+        or bib.get("conference")
+        or ""
+    ).lower()
 
     if "book" in pub_type or "book" in title:
         return "book"
-    if "conference" in pub_type or "conference" in venue or "proceedings" in venue:
+    if (
+        "conference" in pub_type
+        or "inproceedings" in pub_type
+        or "proceedings" in pub_type
+        or "conference" in venue
+        or "proceedings" in venue
+        or usable_metadata(bib.get("booktitle")) is not None
+        or usable_metadata(bib.get("conference")) is not None
+    ):
         return "inproceedings"
     return "article"
 
 
+def bibtex_venue_field(pub: Publication) -> tuple[str, str] | None:
+    bib = pub.get("bib", {})
+
+    if publication_type(pub) == "inproceedings":
+        candidates = (
+            ("booktitle", bib.get("booktitle")),
+            ("booktitle", bib.get("conference")),
+            ("booktitle", bib.get("venue")),
+            ("journal", bib.get("journal")),
+        )
+    else:
+        candidates = (
+            ("journal", bib.get("journal")),
+            ("journal", bib.get("venue")),
+            ("booktitle", bib.get("booktitle")),
+            ("booktitle", bib.get("conference")),
+        )
+
+    for field_name, value in candidates:
+        clean_value = usable_metadata(value)
+        if clean_value is not None:
+            return field_name, clean_value
+
+    return None
+
+
 def bibtex_fields(pub: Publication) -> Iterable[tuple[str, Any]]:
     bib = pub.get("bib", {})
-    field_map = {
-        "title": bib.get("title"),
-        "author": bib.get("author"),
-        "year": bib.get("pub_year") or bib.get("year"),
-        "journal": bib.get("journal") or bib.get("venue"),
-        "volume": bib.get("volume"),
-        "number": bib.get("number"),
-        "pages": bib.get("pages"),
-        "publisher": bib.get("publisher"),
-        "doi": bib.get("doi"),
-        "url": pub.get("pub_url") or pub.get("eprint_url") or pub.get("url"),
-    }
+    field_map: list[tuple[str, Any]] = [
+        ("title", bib.get("title")),
+        ("author", bib.get("author")),
+        ("year", bib.get("pub_year") or bib.get("year")),
+    ]
 
-    for name, value in field_map.items():
+    venue_field = bibtex_venue_field(pub)
+    if venue_field is not None:
+        field_map.append(venue_field)
+
+    field_map.extend(
+        [
+            ("volume", bib.get("volume")),
+            ("number", bib.get("number")),
+            ("pages", bib.get("pages")),
+            ("publisher", bib.get("publisher")),
+            ("doi", bib.get("doi")),
+            ("url", pub.get("pub_url") or pub.get("eprint_url") or pub.get("url")),
+        ]
+    )
+
+    for name, value in field_map:
         if value not in (None, ""):
             yield name, value
 
@@ -393,7 +758,8 @@ def export_to_bibtex(publications: list[Publication], filename: str | Path) -> b
         fields = list(bibtex_fields(pub))
         for field_index, (name, value) in enumerate(fields):
             comma = "," if field_index < len(fields) - 1 else ""
-            lines.append(f"  {name} = {{{bibtex_escape(value)}}}{comma}")
+            field_value = format_bibtex_authors(value) if name == "author" else value
+            lines.append(f"  {name} = {{{bibtex_escape(field_value)}}}{comma}")
         lines.append("}")
         entries.append("\n".join(lines))
 
