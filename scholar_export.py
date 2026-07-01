@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote, urlencode, unquote
@@ -327,6 +328,19 @@ def usable_metadata(value: Any) -> str | None:
     return text
 
 
+def clean_abstract(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    text = unescape(str(value))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"^\s*abstract\s*[:.-]?\s*", "", text, flags=re.IGNORECASE)
+    text = metadata_text(text)
+    if is_placeholder_metadata(text):
+        return None
+    return text
+
+
 def publication_has_truncated_venue(pub: Publication) -> bool:
     bib = pub.get("bib", {})
     return any(
@@ -462,6 +476,7 @@ def apply_crossref_metadata(pub: Publication, item: dict[str, Any]) -> bool:
         "number": first_crossref_value(item, "issue"),
         "pages": first_crossref_value(item, "page"),
         "publisher": first_crossref_value(item, "publisher"),
+        "abstract": clean_abstract(item.get("abstract")),
         "pub_year": crossref_year(item),
     }
     for key, value in metadata_map.items():
@@ -698,6 +713,7 @@ def bibtex_venue_field(pub: Publication) -> tuple[str, str] | None:
 
 def bibtex_fields(pub: Publication) -> Iterable[tuple[str, Any]]:
     bib = pub.get("bib", {})
+    abstract = clean_abstract(bib.get("abstract") or pub.get("abstract"))
     field_map: list[tuple[str, Any]] = [
         ("title", bib.get("title")),
         ("author", bib.get("author")),
@@ -713,6 +729,7 @@ def bibtex_fields(pub: Publication) -> Iterable[tuple[str, Any]]:
             ("volume", bib.get("volume")),
             ("number", bib.get("number")),
             ("pages", bib.get("pages")),
+            ("abstract", abstract),
             ("publisher", bib.get("publisher")),
             ("doi", bib.get("doi")),
             ("url", pub.get("pub_url") or pub.get("eprint_url") or pub.get("url")),
