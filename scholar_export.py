@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+SCRIPT_PATH = Path(__file__).resolve()
 PROJECT_VENV_PYTHON_UNIX = PROJECT_ROOT / ".venv" / "bin" / "python"
 PROJECT_VENV_PYTHON_WINDOWS = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 if os.name == "nt":
@@ -37,7 +39,16 @@ if (
     PROJECT_VENV_PYTHON.exists()
     and Path(sys.executable).resolve() != PROJECT_VENV_PYTHON.resolve()
 ):
-    os.execv(str(PROJECT_VENV_PYTHON), [str(PROJECT_VENV_PYTHON), __file__, *sys.argv[1:]])
+    relaunch_command = [str(PROJECT_VENV_PYTHON), str(SCRIPT_PATH), *sys.argv[1:]]
+    try:
+        completed = subprocess.run(relaunch_command, check=False)
+    except OSError as exc:
+        print(
+            f"Could not relaunch with {PROJECT_VENV_PYTHON}: {exc}",
+            file=sys.stderr,
+        )
+    else:
+        raise SystemExit(completed.returncode)
 
 try:
     from scholarly import scholarly
