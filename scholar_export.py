@@ -9,6 +9,7 @@ import configparser
 import json
 import os
 import re
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -20,7 +21,12 @@ from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PROJECT_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+PROJECT_VENV_PYTHON_UNIX = PROJECT_ROOT / ".venv" / "bin" / "python"
+PROJECT_VENV_PYTHON_WINDOWS = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+if os.name == "nt":
+    PROJECT_VENV_PYTHON = PROJECT_VENV_PYTHON_WINDOWS
+else:
+    PROJECT_VENV_PYTHON = PROJECT_VENV_PYTHON_UNIX
 DEFAULT_CONFIG = PROJECT_ROOT / "scholar_export.conf"
 DEFAULT_EXPORT_DIR_NAME = "exports"
 CROSSREF_WORKS_URL = "https://api.crossref.org/works"
@@ -62,6 +68,7 @@ class SearchConfig:
     patents: bool
     citations: bool
     sort_by: str
+    network_timeout_seconds: float
 
 
 def require_scholarly() -> None:
@@ -73,9 +80,15 @@ def require_scholarly() -> None:
     print(f"Original error: {SCHOLARLY_IMPORT_ERROR}", file=sys.stderr)
     print(file=sys.stderr)
     print("Use the project Python environment:", file=sys.stderr)
-    print("  .venv/bin/python scholar_export.py", file=sys.stderr)
+    if os.name == "nt":
+        print("  .venv\\Scripts\\python.exe scholar_export.py", file=sys.stderr)
+    else:
+        print("  .venv/bin/python scholar_export.py", file=sys.stderr)
     print("or activate it first:", file=sys.stderr)
-    print("  source .venv/bin/activate", file=sys.stderr)
+    if os.name == "nt":
+        print("  .venv\\Scripts\\activate", file=sys.stderr)
+    else:
+        print("  source .venv/bin/activate", file=sys.stderr)
     print("  python scholar_export.py", file=sys.stderr)
     print(file=sys.stderr)
     print("If you really want to use this current interpreter, install pip first,", file=sys.stderr)
@@ -186,6 +199,10 @@ def load_config(path: str | Path) -> SearchConfig:
     if max_results < 1:
         raise ConfigError("search.max_results must be at least 1.")
 
+    network_timeout_seconds = section.getfloat("network_timeout", fallback=30.0)
+    if network_timeout_seconds <= 0:
+        raise ConfigError("search.network_timeout must be greater than 0.")
+
     output_value = section.get("output", fallback=f"publications_{start_year}_{end_year}.bib")
     output = resolve_output_path(config_path, output_value)
 
@@ -201,7 +218,22 @@ def load_config(path: str | Path) -> SearchConfig:
         patents=section.getboolean("patents", fallback=False),
         citations=section.getboolean("citations", fallback=False),
         sort_by=section.get("sort_by", fallback="relevance").strip() or "relevance",
+        network_timeout_seconds=network_timeout_seconds,
     )
+
+
+def configure_network_timeouts(timeout_seconds: float) -> None:
+    # Prevent indefinite network hangs in scholarly/selenium code paths.
+    socket.setdefaulttimeout(timeout_seconds)
+
+    # Selenium uses urllib3 for talking to WebDriver; set its timeout too.
+    try:
+        from selenium.webdriver.remote.remote_connection import RemoteConnection
+
+        RemoteConnection.set_timeout(timeout_seconds)
+    except Exception:
+        # Selenium is optional for this script; ignore if unavailable.
+        pass
 
 
 def parse_year(value: Any) -> int | None:
@@ -557,9 +589,11 @@ def fill_publication(
 def search_publications(config: SearchConfig) -> list[Publication]:
     """Search Google Scholar with the raw configured keyword string."""
     require_scholarly()
+    configure_network_timeouts(config.network_timeout_seconds)
 
     print(f"Searching Google Scholar for: {config.keywords}")
     print(f"Year range: {config.start_year}-{config.end_year}")
+    print(f"Network timeout: {config.network_timeout_seconds:.1f}s")
 
     try:
         search_results = scholarly.search_pubs(
@@ -572,6 +606,11 @@ def search_publications(config: SearchConfig) -> list[Publication]:
         )
     except Exception as exc:
         print(f"Error while starting publication search: {exc}", file=sys.stderr)
+        print(
+            "Tip: if this happens on Windows during captcha/Firefox startup, "
+            "increase search.network_timeout in your config (e.g. 60).",
+            file=sys.stderr,
+        )
         return []
 
     matches: list[Publication] = []
@@ -652,6 +691,10 @@ def search_publications(config: SearchConfig) -> list[Publication]:
                 time.sleep(config.delay_seconds)
     except Exception as exc:
         print(f"Search stopped early: {exc}", file=sys.stderr)
+        print(
+            "Tip: this usually means Scholar throttling/captcha or a driver/network timeout.",
+            file=sys.stderr,
+        )
 
     return matches
 

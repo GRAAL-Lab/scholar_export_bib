@@ -71,6 +71,7 @@ fill_publications = false
 patents = false
 citations = false
 sort_by = relevance
+network_timeout = 30
 ```
 
 Results are written in the `exports/` folder. If the configured BibTeX output
@@ -87,6 +88,18 @@ Or use a different config file:
 
 ```bash
 python scholar_export.py --config my_search.conf
+```
+
+## Windows Note (Avoid Hanging During Scholar/Captcha)
+
+On some Windows setups, Google Scholar captcha handling may trigger Selenium/
+Firefox startup and appear to hang. This project sets a global network timeout
+to avoid blocking forever.
+
+If you still see timeouts, increase this in your config:
+
+```ini
+network_timeout = 60
 ```
 
 Deactivate when done:
