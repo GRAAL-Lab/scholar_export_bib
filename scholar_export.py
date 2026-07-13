@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
@@ -244,7 +245,13 @@ def configure_network_timeouts(timeout_seconds: float) -> None:
     try:
         from selenium.webdriver.remote.remote_connection import RemoteConnection
 
-        RemoteConnection.set_timeout(timeout_seconds)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*set_timeout\(\) in RemoteConnection is deprecated.*",
+                category=DeprecationWarning,
+            )
+            RemoteConnection.set_timeout(timeout_seconds)
     except Exception:
         # Selenium is optional for this script; ignore if unavailable.
         pass
@@ -444,6 +451,9 @@ def clean_abstract(value: Any) -> str | None:
     text = metadata_text(text)
     if is_placeholder_metadata(text):
         return None
+    # Scholar snippets often end with ellipsis; avoid exporting truncated abstracts.
+    if re.search(r"(?:\.\.\.|…)\s*$", text):
+        return None
     return text
 
 
@@ -461,6 +471,20 @@ def publication_has_usable_venue(pub: Publication) -> bool:
         usable_metadata(bib.get(key)) is not None
         for key in ("journal", "booktitle", "conference", "venue")
     )
+
+
+def publication_has_truncated_abstract(pub: Publication) -> bool:
+    bib = pub.get("bib", {})
+    for value in (bib.get("abstract"), pub.get("abstract")):
+        text = metadata_text(value)
+        if text and re.search(r"(?:\.\.\.|…)\s*$", text):
+            return True
+    return False
+
+
+def publication_has_usable_abstract(pub: Publication) -> bool:
+    bib = pub.get("bib", {})
+    return clean_abstract(bib.get("abstract") or pub.get("abstract")) is not None
 
 
 def extract_doi(*values: Any) -> str | None:
@@ -801,14 +825,17 @@ def search_publications(config: SearchConfig) -> list[Publication]:
                     continue
                 publication = filled
 
-            if publication_has_truncated_venue(publication):
+            needs_crossref = publication_has_truncated_venue(publication) or publication_has_truncated_abstract(publication)
+            if needs_crossref:
                 if resolve_crossref_metadata(publication):
-                    print(f"Resolved venue metadata: {title}")
+                    print(f"Resolved metadata from Crossref: {title}")
 
             if (
                 not config.fill_publications
-                and publication_has_truncated_venue(publication)
-                and not publication_has_usable_venue(publication)
+                and (
+                    (publication_has_truncated_venue(publication) and not publication_has_usable_venue(publication))
+                    or not publication_has_usable_abstract(publication)
+                )
             ):
                 filled = fill_publication(
                     publication,
@@ -868,6 +895,13 @@ def search_publications(config: SearchConfig) -> list[Publication]:
         )
         if not matches and config.fallback_to_crossref:
             return search_publications_crossref(config)
+
+    if not matches and config.fallback_to_crossref:
+        print(
+            "Google Scholar returned zero matches; trying Crossref fallback.",
+            file=sys.stderr,
+        )
+        return search_publications_crossref(config)
 
     return matches
 
