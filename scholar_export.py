@@ -32,6 +32,7 @@ else:
 DEFAULT_CONFIG = PROJECT_ROOT / "scholar_export.conf"
 DEFAULT_EXPORT_DIR_NAME = "exports"
 CROSSREF_WORKS_URL = "https://api.crossref.org/works"
+SCHOLAR_PROBE_URL = "https://scholar.google.com/scholar?hl=en&q=test"
 CROSSREF_TIMEOUT_SECONDS = 10
 CROSSREF_USER_AGENT = "scholar_export_bib/1.0"
 
@@ -80,6 +81,7 @@ class SearchConfig:
     citations: bool
     sort_by: str
     network_timeout_seconds: float
+    fallback_to_crossref: bool
 
 
 def require_scholarly() -> None:
@@ -230,6 +232,7 @@ def load_config(path: str | Path) -> SearchConfig:
         citations=section.getboolean("citations", fallback=False),
         sort_by=section.get("sort_by", fallback="relevance").strip() or "relevance",
         network_timeout_seconds=network_timeout_seconds,
+        fallback_to_crossref=section.getboolean("fallback_to_crossref", fallback=True),
     )
 
 
@@ -245,6 +248,66 @@ def configure_network_timeouts(timeout_seconds: float) -> None:
     except Exception:
         # Selenium is optional for this script; ignore if unavailable.
         pass
+
+
+def classify_scholar_exception(exc: Exception) -> str | None:
+    text = metadata_text(exc).lower()
+    if not text:
+        return None
+
+    indicators = [
+        ("cannot fetch from google scholar", "Google Scholar rejected or blocked the request."),
+        ("captcha", "Google Scholar captcha challenge encountered."),
+        ("unusual traffic", "Google Scholar flagged the connection as unusual traffic."),
+        ("not a robot", "Google Scholar returned a bot-check page."),
+        ("429", "Google Scholar rate limit reached (HTTP 429)."),
+        ("403", "Google Scholar denied access (HTTP 403)."),
+        ("timed out", "Network or webdriver request timed out before Scholar responded."),
+        ("timeout", "Network or webdriver request timed out before Scholar responded."),
+    ]
+    for needle, reason in indicators:
+        if needle in text:
+            return reason
+    return None
+
+
+def probe_google_scholar(timeout_seconds: float) -> str | None:
+    request = Request(
+        SCHOLAR_PROBE_URL,
+        headers={"User-Agent": "Mozilla/5.0 scholar_export_bib/1.0"},
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            final_url = response.geturl()
+            status = getattr(response, "status", None)
+            body = response.read(4000).decode("utf-8", errors="ignore").lower()
+    except Exception as probe_exc:
+        return f"Probe failed: {probe_exc}"
+
+    signals: list[str] = []
+    if status is not None:
+        signals.append(f"status={status}")
+    if final_url:
+        signals.append(f"url={final_url}")
+
+    if "sorry" in final_url.lower() or "captcha" in final_url.lower():
+        signals.append("redirected_to_sorry_or_captcha_page")
+    if "unusual traffic" in body:
+        signals.append("body_mentions_unusual_traffic")
+    if "not a robot" in body or "recaptcha" in body:
+        signals.append("body_mentions_bot_check")
+
+    return ", ".join(signals) if signals else "No explicit block signal found in probe."
+
+
+def print_scholar_failure_diagnostics(exc: Exception, timeout_seconds: float) -> None:
+    reason = classify_scholar_exception(exc)
+    if reason:
+        print(f"Scholar diagnostic: {reason}", file=sys.stderr)
+
+    probe_result = probe_google_scholar(timeout_seconds)
+    if probe_result:
+        print(f"Scholar probe: {probe_result}", file=sys.stderr)
 
 
 def parse_year(value: Any) -> int | None:
@@ -490,6 +553,99 @@ def crossref_year(item: dict[str, Any]) -> int | None:
     return None
 
 
+def crossref_authors(item: dict[str, Any]) -> str | None:
+    authors = item.get("author")
+    if not isinstance(authors, list):
+        return None
+
+    names: list[str] = []
+    for author in authors:
+        if not isinstance(author, dict):
+            continue
+
+        family = metadata_text(author.get("family")) if author.get("family") else ""
+        given = metadata_text(author.get("given")) if author.get("given") else ""
+        if family and given:
+            names.append(f"{family}, {given}")
+        elif family:
+            names.append(family)
+        elif given:
+            names.append(given)
+
+    return " and ".join(names) if names else None
+
+
+def publication_from_crossref_item(item: dict[str, Any]) -> Publication | None:
+    title = first_crossref_value(item, "title")
+    year = crossref_year(item)
+    if title is None or year is None:
+        return None
+
+    doi = first_crossref_value(item, "DOI")
+    bib: dict[str, Any] = {
+        "title": title,
+        "author": crossref_authors(item) or "Unknown",
+        "pub_year": str(year),
+        "journal": first_crossref_value(item, "container-title"),
+        "volume": first_crossref_value(item, "volume"),
+        "number": first_crossref_value(item, "issue"),
+        "pages": first_crossref_value(item, "page"),
+        "publisher": first_crossref_value(item, "publisher"),
+        "doi": doi,
+        "abstract": clean_abstract(item.get("abstract")),
+    }
+
+    pub: Publication = {
+        "bib": {k: v for k, v in bib.items() if v not in (None, "")},
+    }
+
+    if doi:
+        pub["pub_url"] = f"https://doi.org/{doi}"
+
+    return pub
+
+
+def search_publications_crossref(config: SearchConfig) -> list[Publication]:
+    print("Falling back to Crossref search.")
+
+    rows = min(max(config.max_results * 5, 20), 200)
+    params = {
+        "query.bibliographic": config.keywords,
+        "rows": str(rows),
+        "filter": f"from-pub-date:{config.start_year},until-pub-date:{config.end_year}",
+    }
+    data = crossref_json(f"{CROSSREF_WORKS_URL}?{urlencode(params)}")
+    items = (data or {}).get("message", {}).get("items", [])
+    if not isinstance(items, list):
+        return []
+
+    matches: list[Publication] = []
+    seen: set[tuple[str, int | None]] = set()
+    for item in items:
+        if len(matches) >= config.max_results:
+            break
+        if not isinstance(item, dict):
+            continue
+
+        publication = publication_from_crossref_item(item)
+        if publication is None:
+            continue
+
+        year = get_pub_year(publication)
+        if year is None or not (config.start_year <= year <= config.end_year):
+            continue
+
+        identity = publication_identity(publication)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        matches.append(publication)
+        print(f"Found (Crossref): {publication.get('bib', {}).get('title', 'untitled')} ({year})")
+
+    return matches
+
+
 def update_missing_bib_value(bib: dict[str, Any], key: str, value: Any) -> bool:
     clean_value = usable_metadata(value)
     if clean_value is None:
@@ -617,11 +773,14 @@ def search_publications(config: SearchConfig) -> list[Publication]:
         )
     except Exception as exc:
         print(f"Error while starting publication search: {exc}", file=sys.stderr)
+        print_scholar_failure_diagnostics(exc, config.network_timeout_seconds)
         print(
             "Tip: if this happens on Windows during captcha/Firefox startup, "
             "increase search.network_timeout in your config (e.g. 60).",
             file=sys.stderr,
         )
+        if config.fallback_to_crossref:
+            return search_publications_crossref(config)
         return []
 
     matches: list[Publication] = []
@@ -702,10 +861,13 @@ def search_publications(config: SearchConfig) -> list[Publication]:
                 time.sleep(config.delay_seconds)
     except Exception as exc:
         print(f"Search stopped early: {exc}", file=sys.stderr)
+        print_scholar_failure_diagnostics(exc, config.network_timeout_seconds)
         print(
             "Tip: this usually means Scholar throttling/captcha or a driver/network timeout.",
             file=sys.stderr,
         )
+        if not matches and config.fallback_to_crossref:
+            return search_publications_crossref(config)
 
     return matches
 

@@ -72,6 +72,7 @@ patents = false
 citations = false
 sort_by = relevance
 network_timeout = 30
+fallback_to_crossref = true
 ```
 
 Results are written in the `exports/` folder. If the configured BibTeX output
@@ -101,6 +102,10 @@ If you still see timeouts, increase this in your config:
 ```ini
 network_timeout = 60
 ```
+
+If Google Scholar still fails with errors like "Cannot fetch from Google Scholar",
+the script now automatically falls back to Crossref when
+`fallback_to_crossref = true`.
 
 Deactivate when done:
 
