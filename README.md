@@ -2,7 +2,7 @@
 
 ## Python Environment Setup
 
-Choose the Python version you want to use:
+Select the Python version you want to use:
 
 ```bash
 PYTHON=python3.12
